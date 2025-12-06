@@ -1,0 +1,363 @@
+---
+title: "Merging Orders with GA"
+author: "Kyle Aagard"
+date: "2025-10-02"
+output: html_document
+---
+
+```{r}
+# import libraries
+library(tidyverse)
+library(skimr)
+library(lubridate)
+library(fuzzyjoin)
+library(data.table)
+
+# set working directory
+setwd("C:/Users/kaaga/OneDrive/Documents/Case Competition")
+
+
+# import the observed sales data
+orders <- read.csv("orders.csv")
+customer <- read.csv("customer.csv")
+material <- read.csv("material.csv")
+google_analytics_final <-read.csv("google_analytics_final.csv")
+```
+
+
+The orders table captures every individual item by it's material id, so it actually outnumbers the add_to_cart entries by quite a lot, so I did not add the individual orders to the google analytics table. When customers add to their cart, there can be multiple items in there.
+```{r}
+# merge or join the orders, customer and material tables
+merged_orders_customer_material <- orders |>
+  left_join(customer, by = c("CUSTOMER_ID" = "CUSTOMER_NUMBER")) |>
+  left_join(material, by = "MATERIAL_ID") 
+
+  
+```
+
+
+Here I am just matching timezones to sales offices.
+```{r}
+sales_office_tz <- tribble(
+  ~SALES_OFFICE_DESCRIPTION,              ~tz_customer,
+  "Draper, UT",               "America/Denver",
+  "Tacoma, WA",               "America/Los_Angeles",
+  "Colorado Springs, CO",     "America/Denver",
+  "Alamosa, CO",              "America/Denver",
+  "Arlington, WA",            "America/Los_Angeles",
+  "Bellevue, WA",             "America/Los_Angeles",
+  "Tucson, AZ",               "America/Phoenix",
+  "Wilsonville, OR",          "America/Los_Angeles",
+  "Tempe, AZ",                "America/Phoenix",
+  "Twin Falls, ID",           "America/Boise",
+  "Ogden, UT",                "America/Denver",
+  "Pocatello, ID",            "America/Boise",
+  "Denver, CO",               "America/Denver",
+  "Boise, ID",                "America/Boise",
+  "Richfield, UT",            "America/Denver",
+  "Spokane, WA",              "America/Los_Angeles",
+  "Albuquerque, NM",          "America/Denver",
+  "Bend, OR",                 "America/Los_Angeles",
+  "Glenwood Springs, CO",     "America/Denver",
+  "Eugene, OR",               "America/Los_Angeles",
+  "Logan, UT",                "America/Denver",
+  "Kingman, AZ",              "America/Phoenix",
+  "Reno, NV",                 "America/Los_Angeles",
+  "Price, UT",                "America/Denver",
+  "Wenatchee, WA",            "America/Los_Angeles",
+  "Prescott, AZ",             "America/Phoenix",
+  "Pendleton, OR",            "America/Los_Angeles",
+  "Lewiston, ID",             "America/Los_Angeles",  # Idaho panhandle is Pacific
+  "Walla Walla, WA",          "America/Los_Angeles",
+  "Idaho Falls, ID",          "America/Boise",
+  "Yuma, AZ",                 "America/Phoenix",
+  "Huachuca City, AZ",        "America/Phoenix",
+  "La Grande, OR",            "America/Los_Angeles",
+  "LaGrande, OR",             "America/Los_Angeles", # misspelled La Grande entries, this was giving NAs.
+  "Scottsbluff, NE",          "America/Denver",
+  "Flagstaff, AZ",            "America/Phoenix",
+  "Glendale, AZ",             "America/Phoenix",
+  "Pueblo, CO",               "America/Denver",
+  "Grand Junction, CO",       "America/Denver",
+  "Bremerton, WA",            "America/Los_Angeles",
+  "Elko, NV",                 "America/Los_Angeles",
+  "Johnstown, CO",            "America/Denver",
+  "Cheyenne, WY",             "America/Denver",
+  "Show Low, AZ",             "America/Phoenix",
+  "Chinle, AZ",               "America/Denver"        # Navajo Nation observes DST
+)
+```
+
+
+Mapping and converting the timestamps.
+
+CREATED_DATE_ADJUSTED is the new column representing when the order was created. This was drawn from CREATED_DATE_UTC column in the orders table
+```{r}
+
+setDT(merged_orders_customer_material)
+setDT(sales_office_tz)
+
+# 1) Map each office to its timezone (adds column tz_customer)
+merged_orders_customer_material[sales_office_tz, on = "SALES_OFFICE_DESCRIPTION", tz_customer := i.tz_customer]
+
+# 2) Parse the raw timestamp as UTC (POSIXct)
+merged_orders_customer_material[, CREATED_DATE_UTC := ymd_hms(CREATED_DATE_UTC, tz = "UTC")]
+
+# 3) Create local-time columns (grouped by timezone for vectorized speed)
+#    - CREATED_DATE_ADJUSTED: character "YYYY-mm-dd HH:MM:SS±hhmm"
+#    - CREATED_DATE_LOCAL   : Date in the local timezone
+merged_orders_customer_material[!is.na(tz_customer),
+  `:=`(
+    CREATED_DATE_ADJUSTED = format(with_tz(CREATED_DATE_UTC, .BY$tz_customer), "%Y-%m-%d %H:%M:%S%z"),
+    CREATED_DATE_LOCAL    = as.Date(with_tz(CREATED_DATE_UTC, .BY$tz_customer))
+  ),
+  by = tz_customer]
+```
+
+
+
+```{r}
+
+# Normalizer: remove spaces/punct, lowercase
+norm_key <- function(x) tolower(gsub("[^a-z]", "", x))
+
+setDT(merged_orders_customer_material)
+setDT(sales_office_tz)
+
+# Ensure target col exists
+if (!"tz_customer" %in% names(merged_orders_customer_material)) {
+  merged_orders_customer_material[, tz_customer := NA_character_]
+}
+
+# Build normalized keys on SALES_OFFICE_DESCRIPTION
+sales_office_tz[,                SALES_OFFICE_KEY := norm_key(SALES_OFFICE_DESCRIPTION)]
+merged_orders_customer_material[, SALES_OFFICE_KEY := norm_key(SALES_OFFICE_DESCRIPTION)]
+
+# Fill tz via update-join (in place, fast)
+merged_orders_customer_material[
+  sales_office_tz[, .(SALES_OFFICE_KEY, tz_customer)],
+  on = .(SALES_OFFICE_KEY),
+  tz_customer := i.tz_customer
+]
+
+# Parse CREATED_DATE_UTC if still character
+if (!inherits(merged_orders_customer_material$CREATED_DATE_UTC, "POSIXct")) {
+  merged_orders_customer_material[, CREATED_DATE_UTC := ymd_hms(CREATED_DATE_UTC, tz = "UTC", quiet = TRUE)]
+}
+
+# Ensure output columns exist
+if (!"CREATED_DATE_ADJUSTED" %in% names(merged_orders_customer_material)) {
+  merged_orders_customer_material[, CREATED_DATE_ADJUSTED := as.POSIXct(NA)]
+}
+if (!"CREATED_DATE_LOCAL" %in% names(merged_orders_customer_material)) {
+  merged_orders_customer_material[, CREATED_DATE_LOCAL := as.Date(NA)]
+}
+
+# Recompute only for rows with a tz and missing adjusted values
+merged_orders_customer_material[
+  !is.na(tz_customer) & is.na(CREATED_DATE_ADJUSTED),
+  `:=`(
+    CREATED_DATE_ADJUSTED = with_tz(CREATED_DATE_UTC, tz_customer),
+    CREATED_DATE_LOCAL    = as.Date(with_tz(CREATED_DATE_UTC, tz_customer))
+  ),
+  by = tz_customer
+]
+
+# checking for missing values
+merged_orders_customer_material[, .(
+  missing_tz   = sum(is.na(tz_customer)),
+  missing_adj  = sum(is.na(CREATED_DATE_ADJUSTED)) # this column represents when the 
+)]
+
+```
+
+
+This is ensuring that we have start and end times, with no NAs.
+```{r}
+# Zero-length intervals at the (now non-NA) adjusted order times
+ord <- merged_orders_customer_material[
+  , .(CUSTOMER_ID, order_time = CREATED_DATE_ADJUSTED)
+][
+  !is.na(order_time)                         
+][
+  , `:=`(o_start = order_time, o_end = order_time)
+]
+
+
+```
+
+
+
+```{r}
+# just checking to make sure there are no NAs
+merged_orders_customer_material[is.na(tz_customer), .N]  # how many rows unmapped
+merged_orders_customer_material[is.na(tz_customer), unique(SALES_OFFICE_DESCRIPTION)]
+```
+
+
+ There are 195 NAs under Material_ID, this doesn't mean much for the google analytics join but it does represent the 195 customers who have not made an order.
+```{r}
+head(merged_orders_customer_material)
+skim(merged_orders_customer_material)
+```
+
+This is adding the CREATED_DATE_ADJUSTED column, and matching the purchase times with add_to_cart events and then tagging them as abandoned or not. 1 indicates the cart was abandoned, 0 that it was not abandoned and 2 is all of the non add_to_cart events. 
+
+```{r}
+
+google_analytics_orders <- copy(google_analytics_final)
+
+# Convert to data.table
+setDT(google_analytics_orders)
+setDT(merged_orders_customer_material)
+
+# Parse to POSIXct if needed (already adjusted to local tz earlier)
+if (!inherits(google_analytics_orders$EVENT_TIMESTAMP_ADJ, "POSIXct")) {
+  google_analytics_orders[, EVENT_TIMESTAMP_ADJ := ymd_hms(EVENT_TIMESTAMP_ADJ, quiet = TRUE)]
+}
+if (!inherits(google_analytics_orders$CUTOFF_TIMESTAMP, "POSIXct")) {
+  google_analytics_orders[, CUTOFF_TIMESTAMP := ymd_hms(CUTOFF_TIMESTAMP, quiet = TRUE)]
+}
+if (!inherits(merged_orders_customer_material$CREATED_DATE_ADJUSTED, "POSIXct")) {
+  merged_orders_customer_material[, CREATED_DATE_ADJUSTED := ymd_hms(CREATED_DATE_ADJUSTED, quiet = TRUE)]
+}
+
+# Stable id to write matches back accurately
+google_analytics_orders[, ga_row := .I]
+
+# Keep only add_to_cart rows and define window end
+ga_add <- google_analytics_orders[
+  EVENT_NAME == "add_to_cart",
+  .(ga_row, CUSTOMER_ID,
+    event_time = EVENT_TIMESTAMP_ADJ,
+    window_end = CUTOFF_TIMESTAMP)
+][
+  !is.na(event_time) & !is.na(window_end) & window_end > event_time
+]
+
+# window_start = previous cutoff per customer (continuous windows)
+setorder(ga_add, CUSTOMER_ID, window_end, event_time)
+ga_add[, window_start := shift(window_end, type = "lag"), by = CUSTOMER_ID]
+
+# If first window has no previous cutoff, set a very early origin
+ga_add[is.na(window_start), window_start := as.POSIXct("1900-01-01 00:00:00")]
+
+# Orders as zero-length intervals; drop NAs
+ord <- merged_orders_customer_material[
+  , .(CUSTOMER_ID, order_time = CREATED_DATE_ADJUSTED)
+][
+  !is.na(order_time)
+][
+  , `:=`(o_start = order_time, o_end = order_time)
+]
+
+# Keys for interval join on (window_start, window_end]
+setkey(ga_add, CUSTOMER_ID, window_start, window_end)
+setkey(ord,    CUSTOMER_ID, o_start,      o_end)
+
+# All orders that fall within the current window (prev_cutoff, cutoff]
+hits <- foverlaps(
+  ord, ga_add,
+  by.x = c("CUSTOMER_ID", "o_start", "o_end"),
+  by.y = c("CUSTOMER_ID", "window_start", "window_end"),
+  type = "within", nomatch = 0L
+)
+
+# AFTER-add matches only (strict), keep earliest after per event
+hits_after <- hits[order_time > event_time][order(order_time)][, .SD[1], by = ga_row]
+setnames(hits_after, "order_time", "match_time")
+
+# Prepare result columns on working copy
+google_analytics_orders[, CREATED_DATE_ADJUSTED_MATCH := as.POSIXct(NA)]
+google_analytics_orders[, ABANDON_FLAG := 2L]  # 2 for non add_to_cart
+
+# Write back matches to the add_to_cart rows
+if (nrow(hits_after) > 0) {
+  google_analytics_orders[hits_after$ga_row, CREATED_DATE_ADJUSTED_MATCH := hits_after$match_time]
+}
+
+# --- PATCH: normalize display TZ so columns compare/print consistently ---
+google_analytics_orders[
+  ,
+  `:=`(
+    EVENT_TIMESTAMP_ADJ         = with_tz(EVENT_TIMESTAMP_ADJ,         "UTC"),
+    CUTOFF_TIMESTAMP            = with_tz(CUTOFF_TIMESTAMP,            "UTC"),
+    CREATED_DATE_ADJUSTED_MATCH = with_tz(CREATED_DATE_ADJUSTED_MATCH, "UTC")
+  )
+]
+
+# --- CLEANUP: keep only matches STRICTLY AFTER add and ≤ cutoff ---
+google_analytics_orders[
+  EVENT_NAME == "add_to_cart" & !is.na(CREATED_DATE_ADJUSTED_MATCH) &
+  (CREATED_DATE_ADJUSTED_MATCH <= EVENT_TIMESTAMP_ADJ |
+   CREATED_DATE_ADJUSTED_MATCH >  CUTOFF_TIMESTAMP),
+  CREATED_DATE_ADJUSTED_MATCH := as.POSIXct(NA)
+]
+
+# Final flags: 0 = not abandoned, 1 = abandoned
+google_analytics_orders[
+  EVENT_NAME == "add_to_cart",
+  ABANDON_FLAG := fifelse(!is.na(CREATED_DATE_ADJUSTED_MATCH), 0L, 1L)
+]
+
+# Drop helper id
+google_analytics_orders[, ga_row := NULL]
+
+# Quick check (optional)
+# table(google_analytics_orders$ABANDON_FLAG)
+
+
+```
+
+
+
+```{r}
+# getting the totals for the abandon_FLAG levels
+google_analytics_orders %>%
+  group_by(ABANDON_FLAG) %>%
+  summarise(count = n(), .groups = "drop")
+```
+24035 + 175576 = 196611
+
+This should match the total number of add to cart
+
+```{r}
+
+# checking to ensure that all add_to_cart events are accounted for 
+google_analytics_orders |>
+  filter(EVENT_NAME == "add_to_cart") |> 
+  group_by(EVENT_NAME) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+Spot checking using a single customer here, making sure that the CREATED_DATE_ADJUSTED_MATCH is between EVENT_TIMESTAMP_ADJ and CUTOFF_TIMESTAMP.
+```{r}
+google_analytics_orders |>
+  filter(EVENT_NAME == "add_to_cart") |>
+  filter(CUSTOMER_ID == "500245738")|>
+  select(c(CUSTOMER_ID, EVENT_NAME, EVENT_TIMESTAMP_ADJ, CUTOFF_TIMESTAMP, CREATED_DATE_ADJUSTED_MATCH, ABANDON_FLAG ))
+```
+
+I don't like the ABANDON_FLAG name, so I am renaming it.
+```{r}
+# renaming the ABANDON_FLAG column
+google_analytics_orders <- google_analytics_orders |>
+  rename(ABANDONED_CART = ABANDON_FLAG)
+```
+
+
+
+```{r}
+# Save merged_orders_customer_material
+write.csv(merged_orders_customer_material,"merged_orders_customer_material.csv",row.names = FALSE)
+
+# Save google_analytics_orders
+write.csv(google_analytics_orders,"google_analytics_orders.csv",row.names = FALSE)
+
+```
+
+```{r}
+head(merged_orders_customer_material)
+```
+
+
