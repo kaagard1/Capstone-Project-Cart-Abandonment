@@ -1,0 +1,1772 @@
+---
+title: "Modeling"
+author: "Kyle Aagard"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-float: true
+    toc-title: "Contents"
+    self-contained: true
+execute:
+  include: true
+  eval: true
+  warning: false
+  message: false
+---
+
+## Introduction 
+
+Note: This is a shortened version of a collaborative notebook we created together, some of the different data preparation functions were written by me and some were written by other team members. As a result I will include the data preparation portions so that the rest of the code will run properly. I will highlight the sections that I worked on and remove modeling and analysis portions that were created by other team members. I will leave in some of the written portions as needed. 
+
+The goal of this modeling notebook is to examine MyCoke360 digital ordering behavior and identify patterns that drive cart abandonment. The target outcome for this analysis is whether a cart is abandoned within an order window. During our exploratory data analysis, we created a target variable and calculated an abandonment rate that was focused at the customer level. After shifting to the purchase window as our unit of measure, which is represented by the `CART_ID` above, we decided we needed to recalculate our target variable. Using the `EVENT_NAME` column, we created a target variable by comparing it to the `EVENT_TIMESTAMP_ADJ` column from the orders table. This timestamp has been adjusted to the local time zone and indicates when an order was created. We compared it to the occurrence of any of the following events in the `EVENT_NAME` column: `add_to_cart`,`update_cart`, or `UpdateCart_Cart_Clicked`. Previously, we used just the `add_to_cart` event, but given that the `google_analytics` data is known to have missed some events, we broadened it to include these other events. If `EVENT_TIMESTAMP_ADJ` occurred between the last of these events and the `CUTOFF_TIMESTAMP`, the cart was classified as not abandoned. If these events never appeared within that time window, the cart was also considered not abandoned. However, if those events occurred but no `EVENT_TIMESTAMP_ADJ` fell within the purchase window before the cutoff, the cart was classified as abandoned. This translates to a supervised learning binary classification problem, where the negative class (0) represents carts that are completed within the order window, and the positive class (1) represents carts that are abandoned.
+
+This modeling report will cover:
+
+  -  Feature engineering including window id, cart id, our updated target variable, total items, and days since last purchased. 
+  -  Analysis of items in abandoned carts to answer the question - which items appear most often in abandoned carts?
+  -  Events and abandoned carts analysis that shows our understanding of the events that lead to cart abandonment.
+  -  Detailed information about our modeling efforts including an interrupted time series model, association rule mining, and two logistic regression models
+  -  Identification of limitations of our modeling efforts, future continuation ideas, and a summary of our findings and conclusions. 
+
+The insights gained from this analysis will helps us identify the behavioral patterns leading to cart abandonment. This will help us to develop interventions to prevent cart abandonment leading to increased customer engagement, increased revenue, and improved return on investment from Swire Coca-Cola's new MyCoke 360 interface. 
+
+By the end of this modeling notebook, we expect to:
+
+  -  Identify the most relevant features and event sequences that contribute to cart abandonment and recovery.
+  -  Generate descriptive statistics and visualizations to highlight abandonment patterns by cart, item, and event. 
+  -  Establish effective feature engineering and descriptive modeling that supports interventions to reduce abandonment.
+
+The findings from this analysis will serve as a foundational step in developing interventions that improve MyCoke360’s ability to optimize digital ordering behavior and minimize revenue loss.
+
+```{r message=FALSE, warning=FALSE}
+# Import libraries
+pacman::p_load(
+  tidyverse, skimr, dplyr, jsonlite, stringr, purrr, tidyr, ggplot2, tibble, 
+  caret, grf, fixest, lubridate, patchwork, data.table, randomForest, 
+  factoextra, mclust, arules, arulesViz, ranger, xgboost, tidytext, 
+  rsample, scales, rlang, speedglm, pROC, dbscan, plotly
+)
+
+# install.packages("dbscan") 
+
+# Import 
+gao <- fread("google_analytics_orders.csv") |>
+  dplyr::select(-EVENT_ROW_ID)
+materials <- fread("material.csv")
+orders <- fread("merged_orders_customer_material.csv")
+
+# Examine the data
+gao |>
+  head()
+```
+
+## Feature Engineering
+
+### Add Order Window ID 
+
+This was written by Eliza Bair.
+
+```{r}
+# Create function to assign windows
+assign_windows <- function(dt) {
+  # Ensure data.table
+  if (!data.table::is.data.table(dt)) data.table::setDT(dt)
+
+  # 1) Parse timestamps
+  dt[, `:=`(
+    CUTOFF_TIMESTAMP    = lubridate::ymd_hms(CUTOFF_TIMESTAMP, quiet = TRUE),
+    EVENT_TIMESTAMP_ADJ = lubridate::ymd_hms(EVENT_TIMESTAMP_ADJ, quiet = TRUE)
+  )]
+
+  # 2) Build windows from DISTINCT cutoffs (per customer)
+  ow <- unique(dt[, .(CUSTOMER_ID, CUTOFF_TIMESTAMP)])
+  data.table::setorder(ow, CUSTOMER_ID, CUTOFF_TIMESTAMP)
+  ow[, `:=`(
+    window_start = data.table::shift(CUTOFF_TIMESTAMP),
+    window_end   = CUTOFF_TIMESTAMP,
+    WINDOW_ID    = seq_len(.N)
+  ), by = CUSTOMER_ID]
+
+  # 3) Non-equi join — assign WINDOW_ID and window bounds
+  dt[
+    ow,
+    on = .(CUSTOMER_ID,
+           EVENT_TIMESTAMP_ADJ > window_start,
+           EVENT_TIMESTAMP_ADJ <= window_end),
+    `:=`(WINDOW_ID    = i.WINDOW_ID,
+         window_start = i.window_start,
+         window_end   = i.window_end)
+  ]
+
+  # 4) Reorder columns for clarity
+  if ("WINDOW_ID" %in% names(dt)) data.table::setcolorder(dt, c("CUSTOMER_ID", "WINDOW_ID"))
+
+  dt  # return modified table
+}
+
+# Run the function on the datset
+gao <- assign_windows(gao)
+
+
+# Create function to assign missing windows
+assign_missing_windows <- function(dt) {
+  stopifnot(is.data.table(dt))  # ensure it's a data.table
+  
+  # 1) Compute per-customer bounds from rows that already have a window
+  bounds <- dt[!is.na(WINDOW_ID),
+    .(
+      first_start = min(window_start, na.rm = TRUE),
+      last_end    = max(window_end,   na.rm = TRUE),
+      last_id     = max(WINDOW_ID,    na.rm = TRUE)
+    ),
+    by = CUSTOMER_ID
+  ]
+  
+  # 2) If NA and before earliest start -> set WINDOW_ID = 0
+  dt[bounds, on = .(CUSTOMER_ID),
+     WINDOW_ID := fifelse(is.na(WINDOW_ID) & EVENT_TIMESTAMP_ADJ <= i.first_start, 0L, WINDOW_ID)]
+  
+  # 3) If NA and after latest end -> set WINDOW_ID = (latest WINDOW_ID + 1)
+  dt[bounds, on = .(CUSTOMER_ID),
+     WINDOW_ID := fifelse(is.na(WINDOW_ID) & EVENT_TIMESTAMP_ADJ > i.last_end, i.last_id + 1L, WINDOW_ID)]
+  
+  # 4) Impute any remaining NAs with 0
+  dt[is.na(WINDOW_ID), WINDOW_ID := 0L]
+  
+  # 5) Remove columns
+  cols_to_remove <- c("window_start", "window_end")
+  dt[, (intersect(cols_to_remove, names(dt))) := NULL]
+  
+  invisible(dt)  # return silently but modifies in place
+}
+
+# Run the function on the datset
+gao <- assign_missing_windows(gao)
+```
+
+### `CART_ID`
+
+This was written by Eliza Bair
+
+ To further understand cart abandonment, we decided to create a `cart_id` using the unique `customer_id` and `cutoff_timestamp`. This unique cart identifier allowed us to start develop an understanding of cart abandonment at the cart level, rather than just at the customer level. Thus, we were able to better understand the behaviors that led to cart abandonment by creating this analysis variable.
+ 
+```{r}
+# Create CART_ID variable
+create_cart_id <- function(gao) {
+  gao |>
+
+    # 2. Ensure proper timestamp formatting
+    mutate(
+      EVENT_TIMESTAMP_ADJ = ymd_hms(EVENT_TIMESTAMP_ADJ),
+      CUTOFF_TIMESTAMP = ymd_hms(CUTOFF_TIMESTAMP)
+    ) |>
+    
+    # 3. Create a unique cart identifier
+    mutate(CART_ID = paste(CUSTOMER_ID, CUTOFF_TIMESTAMP, sep = "_"))
+    
+}
+
+gao <- create_cart_id(gao)
+
+# Check new CART_ID variable
+gao |>
+  head()
+
+# Count the total number of CART_IDs
+gao |>
+  summarize(n_unique_carts = n_distinct(CART_ID)) # 50910
+
+# Sanity check for the number of unique CUSTOMER_ID and CUTOFF_TIMESTAMP combinations
+gao |>
+  group_by(CUSTOMER_ID, CUTOFF_TIMESTAMP) |>
+  summarize(.groups = "drop") |>
+  tally() |>
+  pull(n) # 50910  
+```
+
+### Create Target Variable
+
+This was written by Kyle Aagard.
+
+During our exploratory data analysis, we created a target variable and calculated an abandonment rate that was focused at the customer level. After shifting to the purchase window as our unit of measure, which is represented by the `CART_ID` above, we decided we needed to recalculate our target variable.
+
+Using the `EVENT_NAME` column, we created a target variable by comparing it to the `EVENT_TIMESTAMP_ADJ` column from the orders table. This timestamp has been adjusted to the local time zone and indicates when an order was created. We compared it to the occurrence of any of the following events in the `EVENT_NAME` column: `add_to_cart`, `update_cart`, or `UpdateCart_Cart_Clicked`. Previously, we used just the `add_to_cart` event, but given that the `google_analytics` data is known to have missed some events, we broadened it to include these other events.
+
+If `EVENT_TIMESTAMP_ADJ` occurred between the last of these events and the `CUTOFF_TIMESTAMP`, the cart was classified as not abandoned. If these events never appeared within that time window, the cart was also considered not abandoned. However, if those events occurred but no `EVENT_TIMESTAMP_ADJ` fell within the purchase window before the cutoff, the cart was classified as abandoned.
+
+```{r}
+# define the cart abandonment function
+classify_cart_abandonment <- function(gao, orders) {
+  # parse order timestamps 
+  tz_events <- attr(gao$EVENT_TIMESTAMP_ADJ, "tzone")
+  if (is.null(tz_events) || identical(tz_events, "")) tz_events <- "UTC"
+
+  orders_parsed <- orders |>
+    mutate(
+      CREATED_POSIX = as.POSIXct(
+        CREATED_DATE_ADJUSTED,
+        format = "%Y-%m-%d %H:%M:%S%z",
+        tz = tz_events
+      )
+    ) |>
+    dplyr::select(CUSTOMER_ID, CREATED_POSIX)
+
+  # build one window per cart based on EVENT_NAME activity 
+  cart_windows <- gao |>
+    filter(EVENT_NAME %in% c("add_to_cart", "update_cart", "UpdateCart_Cart_Clicked")) |> # events that we consider creating a cart
+    group_by(CART_ID, CUSTOMER_ID) |>
+    summarise(
+      window_start = max(EVENT_TIMESTAMP_ADJ, na.rm = TRUE),  # last relevant event
+      window_end   = suppressWarnings(max(CUTOFF_TIMESTAMP, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    filter(!is.na(window_end), window_start <= window_end)
+
+  # match each cart window to orders by CUSTOMER_ID to classify abandonment 
+  cart_classified <- cart_windows |>
+    left_join(orders_parsed, by = "CUSTOMER_ID") |>
+    mutate(
+      in_window = !is.na(CREATED_POSIX) &
+                  CREATED_POSIX >= window_start &
+                  CREATED_POSIX <= window_end
+    ) |>
+    group_by(CART_ID) |>
+    summarise(ABANDONED = as.integer(!any(in_window, na.rm = TRUE)), .groups = "drop")
+
+  # add the ABANDONED target variable back to every event row 
+  gao_with_target <- gao |>
+    left_join(cart_classified, by = "CART_ID") |>
+    mutate(ABANDONED = ifelse(is.na(ABANDONED), 0L, ABANDONED))  # treat NAs as not abandoned
+
+  # print summary 
+  summary_counts <- gao_with_target |>
+    summarise(
+      total_carts = n_distinct(CART_ID),
+      abandoned_carts = n_distinct(CART_ID[ABANDONED == 1]),
+      not_abandoned_carts = n_distinct(CART_ID[ABANDONED == 0]),
+      pct_abandoned = round(100 * abandoned_carts / total_carts, 2),
+      pct_not_abandoned = round(100 * not_abandoned_carts / total_carts, 2)
+    )
+
+  cat("\n CART ABANDONMENT SUMMARY\n")
+  print(summary_counts)
+  cat("\n✅ The returned data frame contains", nrow(gao_with_target),
+      "rows — identical to the input gao.\n")
+
+  # return the full event-level dataset with target variable 
+  gao_with_target
+}
+
+
+# call function and create new data set
+gao <- classify_cart_abandonment(gao, orders)
+```
+
+Our number of carts stayed the same, as did our total number of observations. Of our 50,910 carts, a total of 7,539 were abandoned, giving us an abandonment rate of 14.81%.
+
+### Create TOTAL_ITEMS
+
+This was written by Eliza Bair.
+
+We wanted to evaluate how the number of items affected cart abandonment so we created a function to parse and calculate the number of items from the json string in the ITEMS column. This items column resulted in us being able to count the total number of items in a cart at any given time and was critical to our analysis. 
+
+```{r}
+sum_cart_quantities <- function(df, json_col, out_col = "TOTAL_ITEMS") {
+  
+  # Convert strings to symbols for tidy evaluation
+  json_col <- rlang::ensym(json_col)
+  out_col <- rlang::ensym(out_col)
+  
+  # Start timer
+  start_time <- Sys.time()
+  
+  message("⏳ Parsing JSON and summing quantities...")
+  
+  # Apply vectorized parsing logic
+  result <- df %>%
+    mutate(
+      !!out_col := sapply(!!json_col, function(x) {
+        # Handle empty / NA cases quickly
+        if (is.na(x) || x == "" || x == "[]") return(0)
+        
+        # Fix double-double quotes
+        x_clean <- gsub('""', '"', x, fixed = TRUE)
+        
+        # Safely parse JSON
+        items <- tryCatch(fromJSON(x_clean), error = function(e) NULL)
+        
+        # Return 0 if JSON invalid or doesn't have quantity
+        if (is.null(items) || !"quantity" %in% names(items)) return(0)
+        
+        # Sum quantities
+        sum(as.numeric(items$quantity), na.rm = TRUE)
+      })
+    )
+  
+  # End timer
+  end_time <- Sys.time()
+  message(sprintf("✅ Done in %.2f seconds", as.numeric(difftime(end_time, start_time, units = "secs"))))
+  
+  return(result)
+}
+
+# Apply to gao
+gao <- sum_cart_quantities(gao, ITEMS, TOTAL_ITEMS)
+
+# Show TOTAL_ITEMS distribution
+gao |>
+  ggplot(aes(x = TOTAL_ITEMS)) +
+  geom_histogram(bins = 100, fill = "#BB021E", color = "black", alpha = 0.8) +
+  labs(
+    title = "Distribution of Total Items per Cart",
+    x = "Total Items",
+    y = "Count"
+  ) +
+  coord_cartesian(xlim = c(0, 1000)) +
+  theme_minimal()
+
+# Bin total items properly into ITEM_BIN with fixed levels
+bin_levels <- c("1–9", "10–99", "100–999", "1K–9K", "10K–99K", "100K+")
+gao <- gao |>
+  mutate(
+    ITEM_BIN = cut(
+      TOTAL_ITEMS,
+      breaks = c(0, 10, 100, 1000, 10000, 100000, Inf),
+      labels = bin_levels,
+      include.lowest = TRUE,
+      right = FALSE
+    ),
+    ITEM_BIN = factor(ITEM_BIN, levels = bin_levels)  # <- this keeps *all* six bins
+  )
+
+# Plot ITEM_BIN variable
+gao |>
+  ggplot(aes(x = ITEM_BIN)) +
+  geom_bar(fill = "#BB021E", color = "black", alpha = 0.8) +
+  labs(
+    title = "Distribution of Total Items per Cart",
+    x = "Total Items",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+### Add Days Since Last Purchased Field
+
+This was written by Eliza Bair and Ashley Goldstein.
+
+To better understand if the recency of a purchase affects cart abandonment, we engineered a `days_since_last_purchase` variable. This feature measures the number of days between an event and the most recent purchase, providing a proxy variable for consumer engagement. Unfortunately, due to the short time window of this dataset, many customers do not have a prior recorded purchase. In this case, the variable is recorded as `NA` to signify the lack of history. This variable will help us distinguish between new and repeat customers without introducing data leakage via a binary feature.
+
+```{r}
+add_days_since_last_purchase <- function(df, customer_col = CUSTOMER_ID, 
+                                         event_col = EVENT_TIMESTAMP_ADJ, 
+                                         purchase_flag = PURCHASE_EVENT, 
+                                         out_col = DAYS_SINCE_LAST_PURCHASE) {
+  # Convert to quosures for tidy evaluation
+  customer_col <- enquo(customer_col)
+  event_col <- enquo(event_col)
+  purchase_flag <- enquo(purchase_flag)
+  out_col <- enquo(out_col)
+  
+  df |>
+    arrange(!!customer_col, !!event_col) |>
+    group_by(!!customer_col) |>
+    mutate(
+      # Capture last purchase date for each event
+      last_purchase_date = if_else(!!purchase_flag == 1, !!event_col, NA),
+      last_purchase_date = as_datetime(zoo::na.locf(last_purchase_date, na.rm = FALSE)),
+      # Compute days difference
+      !!out_col := floor(as.numeric(difftime(!!event_col, last_purchase_date, units = "days"))
+    )) |>
+    ungroup() |>
+    dplyr::select(-last_purchase_date)
+}
+
+gao <- gao |>
+  mutate(PURCHASE_EVENT = if_else(ABANDONED == 0, 1, 0)) |>
+  add_days_since_last_purchase()
+```
+
+```{r}
+# remove old target variable column from EDA to avoid confusion
+gao <- gao |>
+  dplyr::select(-ABANDONED_CART)
+
+# check to make sure removal worked.
+head(gao)
+```
+
+## Analysis
+
+The following content reflects the contributions and perspective of Kyle Aagard.
+
+
+### Items in Abandoned Carts Analysis
+
+
+
+In an attempt to answer the business question, “Which products appear most frequently in abandoned carts?”, we wanted to find out if there were any specific items or category of items, that are correlated with cart abandonment. So we decided to calculate the number of carts that each item appears in, the number of abandoned carts that have each item, and the rate of abandonment for each item.
+
+Looking at different carts, the items listed in a cart often appear multiple times. To mitigate this, we used the last time the ITEMS column appears with products in it for each individual cart. We also joined the cart back with the materials table so that we could look at categories such as pack size/type, brand, and flavor. 
+
+```{r}
+compute_item_abandonment <- function(gao, materials) {
+
+  item_abandonment <- gao |>
+    # Keep only last entry per cart
+    group_by(CART_ID) |>
+    filter(EVENT_TIMESTAMP_ADJ == max(EVENT_TIMESTAMP_ADJ, na.rm = TRUE)) |>
+    ungroup() |>
+    
+    # Parse JSON safely
+    mutate(ITEMS_PARSED = purrr::map(ITEMS, function(x) {
+      if (is.na(x) || x == "" || x == "[]") return(NULL)
+      
+      # Fix invalid double quotes
+      x_clean <- gsub('""', '"', x, fixed = TRUE)
+      
+      # Try parsing JSON; return NULL if invalid
+      parsed <- tryCatch(fromJSON(x_clean), error = function(e) NULL)
+      return(parsed)
+    })) |>
+    
+    # Unnest only non-empty lists
+    filter(!map_lgl(ITEMS_PARSED, is.null)) |>
+    unnest(ITEMS_PARSED) |>
+    
+    dplyr::select(CART_ID, ITEM_ID = item_id, ABANDONED) |>
+    distinct(CART_ID, ITEM_ID, .keep_all = TRUE) |>
+    
+    # Aggregate by item
+    group_by(ITEM_ID) |>
+    summarise(
+      CARTS_WITH_ITEM = n_distinct(CART_ID),
+      ABANDONED_CARTS_WITH_ITEM = n_distinct(CART_ID[ABANDONED == 1]),
+      NON_ABANDONED_CARTS_WITH_ITEM = n_distinct(CART_ID[ABANDONED == 0]),
+      ABANDONMENT_RATE = ABANDONED_CARTS_WITH_ITEM / CARTS_WITH_ITEM,
+      NON_ABANDONED_RATE = NON_ABANDONED_CARTS_WITH_ITEM / CARTS_WITH_ITEM,
+      .groups = "drop"
+    ) |>
+    
+    # Join to materials
+    mutate(ITEM_ID = suppressWarnings(as.integer(ITEM_ID))) |>
+    inner_join(materials, by = c("ITEM_ID" = "MATERIAL_ID"))
+  
+  return(item_abandonment)
+}
+
+item_abandonment <- compute_item_abandonment(gao, materials)
+
+# display table
+item_abandonment |>
+  arrange(desc(ABANDONMENT_RATE)) |>
+  slice_head(n = 50)
+```
+
+This table shows that there are a few items with very high abandonment rates, but the overall volume per item can be very low. In order to get a better idea of which items are in a higher number of carts and may also have a higher abandonment rate, we decided to create some visuals and tables to help weigh the rate vs volume issue.
+
+#### Top Items Appearing in Abandoned Carts
+
+ Our baseline abandonment rate is approximately 15%, so we decided to take a look at the items that had an abandonment rate above that baseline.
+
+```{r}
+# filter for items with an abandonment rate above 15%
+top_n_items <- item_abandonment |>
+  filter(ABANDONMENT_RATE >= 0.15) |>
+  arrange(desc(ABANDONED_CARTS_WITH_ITEM)) |>
+  slice_head(n = 20)
+
+# max rate in this plot
+max_rate <- max(top_n_items$ABANDONMENT_RATE, na.rm = TRUE)
+
+# plot with legend title showing the max
+ggplot(top_n_items, aes(x = reorder(ITEM_ID, ABANDONED_CARTS_WITH_ITEM),
+                        y = ABANDONED_CARTS_WITH_ITEM,
+                        fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "white",
+    high = "#BB021E",
+    labels = label_percent(accuracy = 1)  
+  ) +
+  labs(
+    title = "Top 20 Items (Abandonment Rate ≥ 15%)",
+    x = "Item SKU",
+    y = "Number of Abandoned Carts",
+    fill = paste0("Abandonment Rate\n(max: ", percent(max_rate, accuracy = 0.1), ")")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+top_n_items
+```
+
+All of these items have an abandonment rate of 15% or higher. SKU 413074, Grandma's Pantry Ginger Chai, stands out for having an abandonment rate of 21%, and it appears in approximately 78 abandoned carts. 
+
+#### Top Flavors Appearing in Abandoned Carts
+
+Next we decided to look at abandonment rates based on the different categories starting with flavor.
+
+```{r}
+# aggregate by flavor, keep only ≥15 % abandonment
+flavor_abandonment <- item_abandonment |>
+  group_by(FLAVOUR_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_FLAVOUR = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_FLAVOUR = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_FLAVOUR / TOTAL_CARTS_WITH_FLAVOUR,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_FLAVOUR))
+
+# Plot top 15 flavors
+ggplot(flavor_abandonment |> slice_head(n = 15),
+       aes(x = reorder(FLAVOUR_DESC, TOTAL_ABANDONED_CARTS_WITH_FLAVOUR),
+           y = TOTAL_ABANDONED_CARTS_WITH_FLAVOUR,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Flavors (Abandonment Rate ≥ 15%)",
+    x = "Flavour",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  # keep vertical grid lines
+    panel.grid.major.y = element_blank(),                 # remove horizontal grid lines
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+head(flavor_abandonment, 15)
+```
+
+What stands out here is that there are a few flavors, such as Vanilla Raspberry, that are present in a large number of abandoned carts and, when they are put into a cart, are abandoned at a higher rate than our baseline.
+
+#### Top Pack Sizes Appearing in Abandoned Carts
+
+```{r}
+# aggregate by pack size and filter for ≥15% abandonment
+packsize_abandonment <- item_abandonment |>
+  mutate(PACK_SIZE_DESC = ifelse(is.na(PACK_SIZE_DESC) | PACK_SIZE_DESC == "", "Unknown", PACK_SIZE_DESC)) |>
+  group_by(PACK_SIZE_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_PACKSIZE = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_PACKSIZE = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_PACKSIZE / TOTAL_CARTS_WITH_PACKSIZE,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_PACKSIZE))
+
+# Plot top 15 pack sizes
+ggplot(packsize_abandonment |> slice_head(n = 15),
+       aes(x = reorder(PACK_SIZE_DESC, TOTAL_ABANDONED_CARTS_WITH_PACKSIZE),
+           y = TOTAL_ABANDONED_CARTS_WITH_PACKSIZE,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Pack Sizes (Abandonment Rate ≥ 15%)",
+    x = "Pack Size",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  
+    panel.grid.major.y = element_blank(),                 
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+head(packsize_abandonment, 15)
+```
+
+While the 20 OZ size does appear in a large number of abandoned carts, that is probably due to it being in a large proportion of all carts. 
+
+#### Top Beverage Categories Appearing in Abandoned Carts
+
+```{r}
+# summarize item-level abandonment into beverage-category level
+bevcat_abandonment <- item_abandonment |>
+  group_by(BEV_CAT_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_BEV_CAT = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_BEV_CAT = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_BEV_CAT / TOTAL_CARTS_WITH_BEV_CAT
+  ) |>
+  arrange(desc(ABANDONMENT_RATE)) |>
+  filter(ABANDONMENT_RATE >= 0.15)
+
+# plot top 15 beverage categories
+ggplot(bevcat_abandonment |> slice_head(n = 15),
+       aes(x = reorder(BEV_CAT_DESC, TOTAL_ABANDONED_CARTS_WITH_BEV_CAT),
+           y = TOTAL_ABANDONED_CARTS_WITH_BEV_CAT,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Abandoned  Beverage Categories",
+    subtitle = "Abandonment Rate ≥ 15%",
+    x = "Beverage Category",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y = element_text(
+      color = "white",
+      angle = 30,       # diagonal angle for long category names
+      hjust = 1,
+      size = 6          
+    ),
+    axis.text.x  = element_text(color = "white", size = 9),
+    axis.title   = element_text(color = "white"),
+    plot.title   = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    plot.subtitle= element_text(color = "white"),
+    legend.text  = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin  = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+ # display table
+head(bevcat_abandonment, 15)
+```
+
+Core Sparkling appears in the highest number of abandoned carts, with an abandonment rate of 15.8%. Enhance Water Beverages has an abandonment rate of 23.11% and appears in 230 abandoned carts.
+
+#### Top Brands Appearing in Abandoned Carts
+
+```{r}
+# aggregate by trade mark / brand and filter for ≥15% abandonment
+trademark_abandonment <- item_abandonment |>
+  mutate(TRADE_MARK_DESC = ifelse(is.na(TRADE_MARK_DESC) | TRADE_MARK_DESC == "", "Unknown", TRADE_MARK_DESC)) |>
+  group_by(TRADE_MARK_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_TRADEMARK = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_TRADEMARK = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_TRADEMARK / TOTAL_CARTS_WITH_TRADEMARK,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_TRADEMARK))
+
+# plot top 15 trade marks
+ggplot(trademark_abandonment |> slice_head(n = 15),
+       aes(x = reorder(TRADE_MARK_DESC, TOTAL_ABANDONED_CARTS_WITH_TRADEMARK),
+           y = TOTAL_ABANDONED_CARTS_WITH_TRADEMARK,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Trade Marks (Abandonment Rate ≥ 15%)",
+    x = "Trade Mark / Brand",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),   
+    panel.grid.major.y = element_blank(),                  
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),  
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+# display table
+head(trademark_abandonment, 15)
+```
+
+At a 16.64% abandonment rate, Fizz Factory’s abandonment rate is only slightly above our 15% baseline, but it is present in a large number of abandoned carts at 3,334.
+
+#### Top Pack Types Appearing in Abandoned Carts
+
+```{r}
+# Aggregate by pack type and filter for ≥15% abandonment
+packtype_abandonment <- item_abandonment |>
+  mutate(PACK_TYPE_DESC = ifelse(is.na(PACK_TYPE_DESC) | PACK_TYPE_DESC == "", "Unknown", PACK_TYPE_DESC)) |>
+  group_by(PACK_TYPE_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_PACKTYPE = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_PACKTYPE = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_PACKTYPE / TOTAL_CARTS_WITH_PACKTYPE,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_PACKTYPE))
+
+# Plot top 15 pack types
+ggplot(packtype_abandonment |> slice_head(n = 15),
+       aes(x = reorder(PACK_TYPE_DESC, TOTAL_ABANDONED_CARTS_WITH_PACKTYPE),
+           y = TOTAL_ABANDONED_CARTS_WITH_PACKTYPE,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Pack Types (Abandonment Rate ≥ 15%)",
+    x = "Pack Type",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),   
+    panel.grid.major.y = element_blank(),                  
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),  
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+# display table
+packtype_abandonment
+```
+
+It is difficult to tell if any of the pack types are potentially contributing to cart abandonment just by looking at the numbers. Taking into account that these are beverages or beverage-related products, it would make sense that the different materials, such as plastic, glass, or aluminum, would appear in a lot of abandoned carts. More modeling would be needed to gain deeper insight.
+
+
+## Events and Abandoned Carts
+
+Another business question was, “What behavioral events or sequence of events are the strongest predictors of cart abandonment?” We thought that `EVENT_NAME` had the best potential to help us answer this question. This column captures up to 148 different events that may occur during a particular purchase window. Many of these events can occur multiple times, such as `button_click`. Others may show up rarely or not at all.
+
+The other issue we had to consider was how the behavior of a large-volume customer, such as a wholesaler or chain retailer, might overpower the behavior of a smaller-volume customer, such as a standalone small restaurant. Taking this into consideration, we decided to compute the proportion of each individual event type that occurred in each purchase window. So, if there were 10 events and 3 of them were `button_click`, then `button_click` would have a score of 0.30. If a specific type of event did not occur, then it would have a score of 0. This way, all of our observations would keep the same dimensions without blank or missing data.
+
+The end result was a single row per `CART_ID`, 50,910 total rows, our target variable `ABANDON`, and 148 columns for all of the unique event names.
+
+This table does not contain any other data, but using `CART_ID`, it could be merged back with the aggregated table containing the other data we have. 
+
+```{r}
+# define function for normalizing events by proportion
+normalize_events_by_cart <- function(gao) {
+  # 1) Exclude the target-related events
+  excluded_events <- c("add_to_cart", "update_cart", "UpdateCart_Cart_Clicked")
+  filtered_events <- gao |>
+    filter(!EVENT_NAME %in% excluded_events)
+
+  # count how many times each event occurs in a cart
+  event_counts <- filtered_events |>
+    group_by(CART_ID, EVENT_NAME) |>
+    summarise(event_count = n(), .groups = "drop")
+
+  # normalize counts to proportions within each cart
+  normalized_events <- event_counts |>
+    group_by(CART_ID) |>
+    mutate(total_events = sum(event_count),
+           prop = event_count / total_events) |>
+    ungroup()
+
+  # pivot to wide format — one column per event
+  event_wide <- normalized_events |>
+    dplyr::select(CART_ID, EVENT_NAME, prop) |>
+    pivot_wider(names_from = EVENT_NAME,
+                values_from = prop,
+                values_fill = 0)
+
+  # add target variable (ABANDONED)
+  cart_target <- gao |>
+    distinct(CART_ID, ABANDONED)
+
+  final_data <- cart_target |>
+    left_join(event_wide, by = "CART_ID") |>
+    mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+  # return final dataset
+  final_data
+}
+
+# apply to gao
+event_normalized <- normalize_events_by_cart(gao)
+
+# display table
+head(event_normalized)
+```
+
+```{r}
+# convert to long for comparison
+events_long <- event_normalized |>
+  pivot_longer(
+    cols = -c(CART_ID, ABANDONED),
+    names_to = "EVENT_NAME",
+    values_to = "prop"
+  )
+
+# mean proportion of each event by abandonment group
+event_group_means <- events_long |>
+  group_by(ABANDONED, EVENT_NAME) |>
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    carts_with_event = sum(prop > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# “Top-N” events per group
+topN <- 10
+top_abandoned <- event_group_means |>
+  filter(ABANDONED == 1) |>
+  arrange(desc(mean_prop)) |>
+  slice_head(n = topN)
+
+top_not_abandoned <- event_group_means |>
+  filter(ABANDONED == 0) |>
+  arrange(desc(mean_prop)) |>
+  slice_head(n = topN)
+
+# difference across groups
+event_lift <- event_group_means |>
+  pivot_wider(
+    names_from = ABANDONED,
+    values_from = c(mean_prop, carts_with_event),
+    names_prefix = "abnd_"
+  ) |>
+  mutate(
+    diff_mean_prop = mean_prop_abnd_1 - mean_prop_abnd_0,
+    abs_diff = abs(diff_mean_prop)
+  ) |>
+  arrange(desc(abs_diff))
+
+# ---- Build the plot and store it ----
+p <- ggplot(event_lift |> slice_max(abs_diff, n = topN),
+       aes(x = reorder(EVENT_NAME, abs_diff),
+           y = diff_mean_prop,
+           fill = diff_mean_prop > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#BB021E", "FALSE" = "white"),
+    labels = c("TRUE" = "Abandoned Carts",
+               "FALSE" = "Non-Abandoned Carts"),
+    name = NULL   
+  ) +
+  labs(
+    title = "Difference in Mean Proportion",
+    x = "Event",
+    y = "Difference in Mean Proportion (Abandoned - Not Abandoned)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    legend.text = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10),
+    legend.position = "bottom"
+  )
+
+# show in notebook
+p
+
+# ---- EXPORT AS PNG ----
+ggsave(
+  filename = "event_lift_plot.png",
+  plot = p,
+  width = 10,        # adjust as needed
+  height = 6,        # adjust as needed
+  dpi = 300,
+  bg = "#1C1C1C"     # makes background export correctly for dark theme
+)
+
+top_abandoned
+top_not_abandoned
+
+```
+
+The two tables list the events that have the largest mean proportion of abandoned and not-abandoned carts. There is a lot of overlap in the types of behaviors that lead up to a cart being abandoned or not. The chart does seem to indicate that events such as `view_item_list` occur a larger proportion of the time in abandoned carts. Overall, these differences appear to be fairly small.
+
+## Modeling
+
+
+
+The hierarchical clustering analysis on a 500-cart sample revealed that MyCoke360 users exhibit subtle but distinguishable behavioral groupings rather than sharply defined segments. Four clusters emerged using Ward’s method: a dense central group representing typical, consistent user behavior; a larger, more diffuse group capturing variable browsing patterns; and two smaller, peripheral clusters likely representing edge-case behaviors such as rapid checkouts or unusually high event activity. Although some separation is visible—suggesting modest differences in how users engage with cart and product-related events—the overlap between clusters indicates that digital ordering behavior is largely continuous. These results reinforce the insight from PCA that cart activity patterns vary by degree rather than by discrete customer types, supporting the use of predictive modeling and behavioral feature analysis over hard segmentation for understanding and reducing cart abandonment.
+
+### DBSCAN Clustering
+
+Next we decided to try the DBSCAN clustering method to see if it could provide insight into what events may contribute to cart abandonment rate. 
+
+```{r}
+# define function to run dbscan, with adjustable inputs
+run_pca_dbscan <- function(
+  data,
+  n_top_cols = 20,          # keep top-N columns by mean
+  n_pcs = 10,               # PCs to retain for DBSCAN
+  n_contrib_vars = 10,      # top PCA contributors shown in var plot
+  k_nn = 5,                 # k for eps elbow
+  minPts = 10,              # DBSCAN minPts
+  small_cluster_prop = 0.01,
+  seed = 123
+) {
+  stopifnot(is.data.frame(data))
+  set.seed(seed)
+
+  # numeric only
+  data_num <- data[, sapply(data, is.numeric), drop = FALSE]
+
+  # top-N by mean
+  means <- colMeans(data_num, na.rm = TRUE)
+  keep_cols <- names(sort(means, decreasing = TRUE))[seq_len(min(n_top_cols, length(means)))]
+  data_top  <- data_num[, keep_cols, drop = FALSE]
+
+  # scale
+  data_scaled <- scale(data_top)
+
+  # PCA
+  pca <- prcomp(data_scaled, center = TRUE, scale. = TRUE)
+  n_pcs <- min(n_pcs, ncol(pca$x))
+  reduced_data <- pca$x[, seq_len(n_pcs), drop = FALSE]
+  pca_vis      <- pca$x[, 1:2, drop = FALSE]
+
+  # PCA variable plot 
+  pca_var_plot <- fviz_pca_var(
+    pca,
+    col.var = "white",
+    repel = TRUE,
+    pointsize = 3,
+    title = sprintf("PCA Variable Plot (Top %d Contributing Variables)", n_contrib_vars),
+    select.var = list(contrib = n_contrib_vars)
+  ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      legend.text  = element_text(color = "white"),
+      legend.title = element_text(color = "white"),
+      legend.position = "bottom",
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  # Display PCA variable contribution plot
+  print(pca_var_plot)
+
+  # eps elbow
+  find_eps_elbow <- function(Z, k = 5) {
+    d <- sort(kNNdist(Z, k = k))
+    n <- length(d)
+    x_sc <- (seq_len(n) - 1)/(n - 1)
+    y_sc <- (d - min(d))/(max(d) - min(d))
+    eps <- d[which.max(abs(y_sc - x_sc))]
+    eps
+  }
+  best_eps <- find_eps_elbow(reduced_data, k = k_nn)
+
+  # DBSCAN
+  db <- dbscan::dbscan(reduced_data, eps = best_eps, minPts = minPts)
+  labels <- db$cluster
+
+  # filter micro-clusters into noise 
+  cl_sizes <- table(labels)
+  size_thresh <- ceiling(small_cluster_prop * nrow(reduced_data))
+  large_ids <- as.integer(names(cl_sizes[cl_sizes >= size_thresh]))
+  filtered_labels <- ifelse(labels %in% large_ids, labels, 0L)
+
+  # diagnostics: clusters and silhoutte
+  n_clusters <- length(unique(filtered_labels[filtered_labels > 0]))
+  n_noise    <- sum(filtered_labels == 0)
+
+  if (n_clusters > 1) {
+    n_for_sil <- min(5000, nrow(reduced_data))
+    sample_idx <- sample(seq_len(nrow(reduced_data)), n_for_sil)
+    sil <- cluster::silhouette(filtered_labels[sample_idx],
+                               dist(reduced_data[sample_idx, ]))
+    silhouette_score <- mean(sil[, 3])
+  } else {
+    silhouette_score <- NA_real_
+  }
+
+  cat("\nDBSCAN Summary\n",
+      "  eps: ", round(best_eps, 4), "  minPts: ", minPts, "\n",
+      "  clusters (non-noise): ", n_clusters, "\n",
+      "  noise points: ", n_noise, "\n",
+      "  avg silhouette: ", ifelse(is.na(silhouette_score), "NA", round(silhouette_score, 3)),
+      "\n", sep = "")
+
+  plot_idx <- seq_len(nrow(reduced_data))
+  pca_vis_plot <- pca_vis[plot_idx, , drop = FALSE]
+  labels_plot  <- filtered_labels[plot_idx]
+
+  list(
+    data_scaled      = data_scaled,
+    keep_cols        = keep_cols,
+    pca              = pca,
+    reduced_data     = reduced_data,
+    pca_vis          = pca_vis,
+    best_eps         = best_eps,
+    minPts           = minPts,
+    labels_raw       = labels,
+    labels_filtered  = filtered_labels,
+    n_clusters       = n_clusters,
+    n_noise          = n_noise,
+    silhouette_score = silhouette_score,
+    plot_idx         = plot_idx,
+    pca_vis_plot     = pca_vis_plot,
+    labels_plot      = labels_plot,
+    pca_var_plot     = pca_var_plot   
+  )
+}
+```
+
+```{r}
+# define function for 3D visualization + PCA interpretation
+visualize_dbscan_3d <- function(
+  prep_obj,
+  num_pcs_plot = 4,
+  top_n_clusters = 3,
+  point_size = 3,
+  top_features = 5       # how many top-loading variables to show per PC
+) {
+  stopifnot(is.list(prep_obj), !is.null(prep_obj$pca), !is.null(prep_obj$labels_filtered))
+
+  pca      <- prep_obj$pca
+  labels   <- prep_obj$labels_filtered
+  pcscores <- pca$x
+  loadings <- pca$rotation   # <--- loadings for interpretation
+
+  # --- interpret PCs ---
+  interpret_pc <- function(pc_index, top = top_features) {
+    vec <- loadings[, pc_index]
+    ord <- order(abs(vec), decreasing = TRUE)
+
+    top_vars <- names(vec)[ord[1:top]]
+    top_vals <- vec[ord[1:top]]
+
+    pos <- top_vars[top_vals > 0]
+    neg <- top_vars[top_vals < 0]
+
+    description <- paste0(
+      "PC", pc_index, " represents:\n",
+      "  • High values of: ", ifelse(length(pos)==0, "None", paste(pos, collapse=", ")), "\n",
+      "  • Low values of:  ", ifelse(length(neg)==0, "None", paste(neg, collapse=", "))
+    )
+
+    list(
+      top_loadings = tibble::tibble(
+        feature = top_vars,
+        loading = top_vals
+      ),
+      description = description
+    )
+  }
+
+  pc_interpretations <- lapply(seq_len(num_pcs_plot), interpret_pc)
+
+  # --- cluster selection ---
+  nn <- labels[labels > 0]
+  if (length(nn) == 0) stop("No non-noise clusters to visualize.")
+  cl_sizes <- sort(table(nn), decreasing = TRUE)
+  top_ids  <- as.integer(names(cl_sizes)[seq_len(min(top_n_clusters, length(cl_sizes)))])
+
+  keep <- labels %in% top_ids
+  pca_top  <- pcscores[keep, , drop = FALSE]
+  labs_top <- factor(labels[keep])
+
+  cols <- c("#FFFFFF", "#BB021E", "#E7B800")[seq_len(length(unique(labs_top)))]
+
+  num_pcs_plot <- min(num_pcs_plot, ncol(pca_top))
+  triples <- combn(num_pcs_plot, 3, simplify = FALSE)
+
+  plots <- vector("list", length(triples))
+  names(plots) <- vapply(triples, function(t) sprintf("PC%d_PC%d_PC%d", t[1], t[2], t[3]), character(1))
+
+  for (i in seq_along(triples)) {
+    t <- triples[[i]]
+    pc1 <- t[1]; pc2 <- t[2]; pc3 <- t[3]
+
+    p <- plot_ly(
+      x = ~pca_top[, pc1],
+      y = ~pca_top[, pc2],
+      z = ~pca_top[, pc3],
+      color = ~labs_top,
+      colors = cols,
+      type = "scatter3d",
+      mode  = "markers",
+      marker = list(size = point_size)
+    ) %>%
+      layout(
+        title = list(
+          text = sprintf("DBSCAN — Top %d Clusters in PCA 3D (PC%d–PC%d–PC%d)",
+                         length(unique(labs_top)), pc1, pc2, pc3),
+          font = list(color = "white", size = 16)
+        ),
+        scene = list(
+          xaxis = list(title = paste0("PC", pc1), titlefont = list(color = "white"),
+                       tickfont = list(color = "white"), backgroundcolor = "#1C1C1C",
+                       gridcolor = "gray40", zerolinecolor = "gray40", showbackground = TRUE),
+          yaxis = list(title = paste0("PC", pc2), titlefont = list(color = "white"),
+                       tickfont = list(color = "white"), backgroundcolor = "#1C1C1C",
+                       gridcolor = "gray40", zerolinecolor = "gray40", showbackground = TRUE),
+          zaxis = list(title = paste0("PC", pc3), titlefont = list(color = "white"),
+                       tickfont = list(color = "white"), backgroundcolor = "#1C1C1C",
+                       gridcolor = "gray40", zerolinecolor = "gray40", showbackground = TRUE)
+        ),
+        legend = list(
+          title = list(text = "<b>Cluster</b>", font = list(color = "white")),
+          font  = list(color = "white"),
+          bgcolor = "#1C1C1C"
+        ),
+        paper_bgcolor = "#1C1C1C",
+        plot_bgcolor  = "#1C1C1C"
+      )
+
+    plots[[i]] <- p
+  }
+
+  list(
+    plots = plots,
+    top_clusters = top_ids,
+    cluster_sizes = cl_sizes,
+
+    # diagnostics
+    n_clusters = prep_obj$n_clusters,
+    n_noise = prep_obj$n_noise,
+    silhouette_score = prep_obj$silhouette_score,
+
+    # NEW: PCA interpretation
+    pc_interpretations = pc_interpretations
+  )
+}
+
+```
+
+```{r}
+
+# define summary function
+summarize_clusters <- function(
+  prep_obj,
+  data,                      # original data frame (must include target)
+  target_col = c("ABANDONED_CART", "ABANDONED"),
+  min_cluster_size = 500
+) {
+  stopifnot(is.list(prep_obj), is.data.frame(data))
+  target_col <- match.arg(target_col)
+
+  labels <- prep_obj$labels_filtered
+  if (length(labels) != nrow(data)) {
+    stop("Row count of labels does not match the provided data. Ensure function 1 ran on the same data (no sampling).")
+  }
+  if (!target_col %in% names(data)) {
+    stop(sprintf("Column '%s' not found in `data`.", target_col))
+  }
+
+  # print diagnostics from run_pca_dbscan
+  cat("\nCluster Diagnostics\n",
+      "  clusters (non-noise): ", prep_obj$n_clusters, "\n",
+      "  noise points: ", prep_obj$n_noise, "\n",
+      "  avg silhouette: ", ifelse(is.na(prep_obj$silhouette_score), "NA", round(prep_obj$silhouette_score, 3)),
+      "\n", sep = "")
+
+  library(dplyr); library(ggplot2); library(scales); library(reshape2)
+
+  clust_df <- dplyr::tibble(
+    row_id  = seq_len(nrow(data)),
+    cluster = as.integer(labels),
+    target  = as.integer(data[[target_col]])
+  ) %>%
+    filter(!is.na(target))
+
+  cluster_rates <- clust_df %>%
+    group_by(cluster) %>%
+    summarise(
+      n = n(),
+      abandoned = sum(target == 1),
+      rate = abandoned / n,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+
+  valid_clusters <- cluster_rates %>%
+    filter(n > min_cluster_size, cluster != 0) %>%
+    pull(cluster)
+
+  gg_rate <- ggplot(cluster_rates %>% filter(cluster %in% valid_clusters),
+                    aes(x = factor(cluster), y = rate)) +
+    geom_col(fill = "#BB021E") +
+    geom_text(aes(label = percent(rate, accuracy = 0.1)),
+              vjust = -0.4, color = "white", size = 3.5) +
+    labs(
+      x = "DBSCAN Cluster",
+      y = "Abandonment Rate",
+      title = sprintf("Abandonment Rate by DBSCAN Cluster (n > %d) — Target: %s",
+                      min_cluster_size, target_col)
+    ) +
+    ylim(0, 1) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  # feature means (scaled features from prep_obj$data_scaled)
+  data_scaled <- as.data.frame(prep_obj$data_scaled)
+  data_scaled$cluster <- labels
+
+  feature_means <- data_scaled %>%
+    filter(cluster %in% valid_clusters) %>%
+    group_by(cluster) %>%
+    summarise(across(where(is.numeric), mean), .groups = "drop")
+
+  cluster_summary <- feature_means %>%
+    left_join(cluster_rates %>% dplyr::select(cluster, n, abandoned, abandonment_rate = rate),
+              by = "cluster") %>%
+    arrange(desc(n))
+
+  cluster_summary_long <- cluster_summary %>%
+    dplyr::select(-n, -abandoned) %>%
+    melt(id.vars = c("cluster", "abandonment_rate"))
+
+  pal_clusters <- colorRampPalette(c("white", "#BB021E"))(length(unique(cluster_summary_long$cluster)))
+
+  gg_features <- ggplot(cluster_summary_long,
+                        aes(x = variable, y = value, fill = factor(cluster))) +
+    geom_col(position = "dodge") +
+    coord_flip() +
+    scale_fill_manual(values = pal_clusters, name = "Cluster") +
+    labs(
+      x = "Event Feature (scaled)",
+      y = "Standard Deviations From Mean",
+      title = sprintf("Event Feature Means by Cluster (n > %d)", min_cluster_size)
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      legend.text  = element_text(color = "white"),
+      legend.title = element_text(color = "white"),
+      legend.position = "bottom",
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  list(
+    cluster_rates     = cluster_rates,
+    valid_clusters    = valid_clusters,
+    cluster_summary   = cluster_summary,
+    rate_plot         = gg_rate,
+    feature_plot      = gg_features,
+    # surface key diagnostics here too
+    n_clusters        = prep_obj$n_clusters,
+    n_noise           = prep_obj$n_noise,
+    silhouette_score  = prep_obj$silhouette_score
+  )
+}
+```
+
+
+```{r}
+summarize_clusters <- function(
+  prep_obj,
+  data,
+  target_col = c("ABANDONED_CART", "ABANDONED"),
+  min_cluster_size = 500,
+  features_to_show = NULL
+) {
+  stopifnot(is.list(prep_obj), is.data.frame(data))
+  target_col <- match.arg(target_col)
+
+  labels <- prep_obj$labels_filtered
+  if (length(labels) != nrow(data)) {
+    stop("Row count of labels does not match the provided data. Ensure function 1 ran on the same data (no sampling).")
+  }
+  if (!target_col %in% names(data)) {
+    stop(sprintf("Column '%s' not found in `data`.", target_col))
+  }
+
+  # print diagnostics
+  cat("\nCluster Diagnostics\n",
+      "  clusters (non-noise): ", prep_obj$n_clusters, "\n",
+      "  noise points: ", prep_obj$n_noise, "\n",
+      "  avg silhouette: ", ifelse(is.na(prep_obj$silhouette_score), "NA", round(prep_obj$silhouette_score, 3)),
+      "\n", sep = "")
+
+  library(dplyr); library(ggplot2); library(scales); library(reshape2)
+
+  clust_df <- tibble(
+    row_id  = seq_len(nrow(data)),
+    cluster = as.integer(labels),
+    target  = as.integer(data[[target_col]])
+  ) %>% filter(!is.na(target))
+
+  cluster_rates <- clust_df %>%
+    group_by(cluster) %>%
+    summarise(
+      n = n(),
+      abandoned = sum(target == 1),
+      rate = abandoned / n,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+
+  valid_clusters <- cluster_rates %>%
+    filter(n > min_cluster_size, cluster != 0) %>%
+    pull(cluster)
+
+  # ======== CONSISTENT COLOR PALETTE FOR BOTH PLOTS ========
+  pal_clusters <- colorRampPalette(c("white", "#BB021E"))(
+    length(unique(valid_clusters))
+  )
+
+  # ======== Abandonment Rate Plot (UPDATED) ========
+  gg_rate <- ggplot(
+      cluster_rates %>% filter(cluster %in% valid_clusters),
+      aes(x = factor(cluster), y = rate, fill = factor(cluster))  # CHANGED
+    ) +
+    geom_col() +
+    geom_text(aes(label = percent(rate, accuracy = 0.1)),
+              vjust = -0.4, color = "white", size = 3.5) +
+    scale_fill_manual(values = pal_clusters, name = "Cluster") +  # CHANGED
+    labs(
+      x = "DBSCAN Cluster",
+      y = "Abandonment Rate",
+      title = sprintf("Abandonment Rate by DBSCAN Cluster (n > %d) — Target: %s",
+                      min_cluster_size, target_col)
+    ) +
+    ylim(0, 1) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  # ======== Feature Means ========
+  data_scaled <- as.data.frame(prep_obj$data_scaled)
+  data_scaled$cluster <- labels
+
+  feature_means <- data_scaled %>%
+    filter(cluster %in% valid_clusters) %>%
+    group_by(cluster) %>%
+    summarise(across(where(is.numeric), mean), .groups = "drop")
+
+  cluster_summary <- feature_means %>%
+    left_join(cluster_rates %>% select(cluster, n, abandoned, abandonment_rate = rate),
+              by = "cluster") %>%
+    arrange(desc(n))
+
+  cluster_summary_long <- cluster_summary %>%
+    select(-n, -abandoned) %>%
+    melt(id.vars = c("cluster", "abandonment_rate"))
+
+  # Filter to selected features
+  if (!is.null(features_to_show)) {
+    missing <- setdiff(features_to_show, unique(cluster_summary_long$variable))
+    if (length(missing) > 0) {
+      warning("These features not found in cluster summary: ",
+              paste(missing, collapse = ", "))
+    }
+    cluster_summary_long <- cluster_summary_long %>%
+      filter(variable %in% features_to_show)
+  }
+
+  gg_features <- ggplot(cluster_summary_long,
+                        aes(x = variable, y = value, fill = factor(cluster))) +
+    geom_col(position = "dodge") +
+    coord_flip() +
+    scale_fill_manual(values = pal_clusters, name = "Cluster") +   # SAME PALETTE
+    labs(
+      x = "Event Feature (scaled)",
+      y = "Standard Deviations From Mean",
+      title = sprintf("Event Feature Means by Cluster (n > %d)", min_cluster_size)
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      legend.text  = element_text(color = "white"),
+      legend.title = element_text(color = "white"),
+      legend.position = "bottom",
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  list(
+    cluster_rates     = cluster_rates,
+    valid_clusters    = valid_clusters,
+    cluster_summary   = cluster_summary,
+    rate_plot         = gg_rate,
+    feature_plot      = gg_features,
+    n_clusters        = prep_obj$n_clusters,
+    n_noise           = prep_obj$n_noise,
+    silhouette_score  = prep_obj$silhouette_score
+  )
+}
+
+
+```
+
+
+
+```{r}
+summarize_clusters <- function(
+  prep_obj,
+  data,
+  target_col = c("ABANDONED_CART", "ABANDONED"),
+  min_cluster_size = 500,
+  features_to_show = NULL
+) {
+  stopifnot(is.list(prep_obj), is.data.frame(data))
+  target_col <- match.arg(target_col)
+
+  labels <- prep_obj$labels_filtered
+  if (length(labels) != nrow(data)) {
+    stop("Row count of labels does not match the provided data. Ensure function 1 ran on the same data (no sampling).")
+  }
+  if (!target_col %in% names(data)) {
+    stop(sprintf("Column '%s' not found in `data`.", target_col))
+  }
+
+  # print diagnostics
+  cat("\nCluster Diagnostics\n",
+      "  clusters (non-noise): ", prep_obj$n_clusters, "\n",
+      "  noise points: ", prep_obj$n_noise, "\n",
+      "  avg silhouette: ", ifelse(is.na(prep_obj$silhouette_score), "NA", round(prep_obj$silhouette_score, 3)),
+      "\n", sep = "")
+
+  library(dplyr); library(ggplot2); library(scales); library(reshape2)
+
+  clust_df <- tibble(
+    row_id  = seq_len(nrow(data)),
+    cluster = as.integer(labels),
+    target  = as.integer(data[[target_col]])
+  ) %>% filter(!is.na(target))
+
+  cluster_rates <- clust_df %>%
+    group_by(cluster) %>%
+    summarise(
+      n = n(),
+      abandoned = sum(target == 1),
+      rate = abandoned / n,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+
+  valid_clusters <- cluster_rates %>%
+    filter(n > min_cluster_size, cluster != 0) %>%
+    pull(cluster)
+
+  # CONSISTENT COLOR PALETTE
+  pal_clusters <- colorRampPalette(c("white", "#BB021E"))(
+    length(unique(valid_clusters))
+  )
+
+  # ======== Abandonment Rate Plot ========
+  gg_rate <- ggplot(
+      cluster_rates %>% filter(cluster %in% valid_clusters),
+      aes(x = factor(cluster), y = rate, fill = factor(cluster))
+    ) +
+    geom_col() +
+    geom_text(aes(label = percent(rate, accuracy = 0.1)),
+              vjust = -0.4, color = "white", size = 3.5) +
+    scale_fill_manual(values = pal_clusters, name = "Cluster") +
+    labs(
+      x = "DBSCAN Cluster",
+      y = "Abandonment Rate",
+      title = sprintf("Abandonment Rate by DBSCAN Cluster (n > %d) — Target: %s",
+                      min_cluster_size, target_col)
+    ) +
+    ylim(0, 1) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.background = element_rect(fill = "#1C1C1C", color = NA),
+      panel.grid.major.x = element_line(color = "gray30"),
+      axis.text  = element_text(color = "white", size = 9),
+      axis.title = element_text(color = "white"),
+      plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+      plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+    )
+
+  # ======== RAW FEATURE DIFFERENCE MEANS ========
+  # Extract only numeric event features (not target, not IDs)
+  raw_features <- data %>%
+    select(where(is.numeric)) %>%
+    select(-all_of(target_col))
+
+  raw_features$cluster <- labels
+
+  # cluster raw means
+  cluster_raw_means <- raw_features %>%
+    filter(cluster %in% valid_clusters) %>%
+    group_by(cluster) %>%
+    summarise(across(where(is.numeric), mean), .groups = "drop")
+
+  # overall means
+  overall_means <- raw_features %>%
+    summarise(across(where(is.numeric), mean))
+
+  # compute mean difference: (cluster_mean - overall_mean)
+  diff_means <- cluster_raw_means
+  for (col in names(overall_means)) {
+    if (col != "cluster") {
+      diff_means[[col]] <- diff_means[[col]] - overall_means[[col]]
+    }
+  }
+
+  # merge with cluster stats
+  cluster_summary <- diff_means %>%
+    left_join(cluster_rates %>% select(cluster, n, abandoned, abandonment_rate = rate),
+              by = "cluster") %>%
+    arrange(desc(n))
+
+  cluster_summary_long <- cluster_summary %>%
+    select(-n, -abandoned) %>%
+    melt(id.vars = c("cluster", "abandonment_rate"))
+
+  # Filter to selected features
+  if (!is.null(features_to_show)) {
+    missing <- setdiff(features_to_show, unique(cluster_summary_long$variable))
+    if (length(missing) > 0) {
+      warning("These features not found: ", paste(missing, collapse = ", "))
+    }
+    cluster_summary_long <- cluster_summary_long %>%
+      filter(variable %in% features_to_show)
+  }
+
+  # ======== Updated Feature Mean Difference Plot ========
+  gg_features <- ggplot(cluster_summary_long,
+                      aes(x = variable, y = value, fill = factor(cluster))) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = pal_clusters, name = "Cluster") +
+  labs(
+    x = "Event",
+    y = "Difference From Overall Mean",
+    title = sprintf("Difference in Mean Proportion by Cluster",
+                    min_cluster_size)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+
+    # --- UPDATED TO MATCH YOUR EXAMPLE ---
+    panel.grid.major.x = element_line(color = "gray30"),  
+    panel.grid.major.y = element_blank(),                 
+    panel.grid.minor = element_blank(),                   
+
+    axis.text  = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+
+    legend.text  = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    legend.position = "bottom",
+
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+
+  list(
+    cluster_rates     = cluster_rates,
+    valid_clusters    = valid_clusters,
+    cluster_summary   = cluster_summary,
+    rate_plot         = gg_rate,
+    feature_plot      = gg_features,
+    n_clusters        = prep_obj$n_clusters,
+    n_noise           = prep_obj$n_noise,
+    silhouette_score  = prep_obj$silhouette_score
+  )
+}
+
+```
+
+
+
+
+```{r}
+ 
+
+library(htmlwidgets)
+
+# --- Prep + PCA + DBSCAN ---
+prep <- run_pca_dbscan(
+  data = event_normalized[, -c(1,2)], 
+  n_top_cols = 20, 
+  n_pcs = 10, 
+  n_contrib_vars = 10
+)
+
+# --- Diagnostics ---
+prep$n_clusters
+prep$n_noise
+prep$silhouette_score
+
+# --- 3D visualization (with PC interpretation) ---
+viz <- visualize_dbscan_3d(
+  prep,
+  num_pcs_plot = 4,
+  top_n_clusters = 5
+)
+
+p3d <- viz$plots[[1]]
+p3d   # display in notebook
+
+# --- Save interactive HTML ---
+saveWidget(
+  widget        = p3d,
+  file          = "dbscan_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# ======================================================
+# NEW: Automatically show PCA interpretations
+# ======================================================
+cat("\n================ PCA INTERPRETATION ================\n")
+
+for (i in seq_along(viz$pc_interpretations)) {
+  cat("\n--- PC", i, "---\n")
+  cat(viz$pc_interpretations[[i]]$description, "\n\n")
+
+  print(
+    viz$pc_interpretations[[i]]$top_loadings
+  )
+}
+
+cat("\n=====================================================\n\n")
+
+
+# ======================================================
+# --- NEW FEATURE LIST ---
+# ======================================================
+selected_features <- c(
+  "page_view",
+  "view_item_list",
+  "pay_invoice_click",
+  "button_click",
+  "nav_link_click",
+  "remove_from_cart",
+  "view_site_search",
+  "view_item",
+  "purchase",
+  "proceed_to_checkout"
+)
+
+# --- Summaries (using selected features) ---
+summ <- summarize_clusters(
+  prep,
+  data = event_normalized,
+  target_col = "ABANDONED",
+  min_cluster_size = 500,
+  features_to_show = selected_features
+)
+
+# --- Output ---
+summ$n_clusters
+summ$silhouette_score
+summ$rate_plot
+summ$feature_plot
+
+
+
+```
+
+The DBSCAN model identified three non-noise clusters with an average silhouette score of 0.571, indicating that observations within each cluster are, on average, more similar to one another than to those in other clusters.
+
+The 3D visualization reveals that Cluster 2 passes through the center of Cluster 1; however, the two clusters occupy distinct regions within the feature space. This spatial separation further aligns with the moderate silhouette score, suggesting a meaningful but not absolute distinction between clusters.
+
+Analysis of event feature means highlights behavioral differences across clusters. Specifically, Cluster 2 demonstrates a higher abandonment rate than Cluster 1, with notable disparities in events such as user_engagement and screen_view, which appear to be key drivers of the observed behavioral segmentation. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
