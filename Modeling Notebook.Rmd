@@ -265,7 +265,7 @@ classify_cart_abandonment <- function(gao, orders) {
 gao <- classify_cart_abandonment(gao, orders)
 ```
 
-Our number of carts stayed the same, as did our total number of observations. Of our 50,910 carts, a total of 7,539 were abandoned, giving us an abandonment rate of 14.81%.
+Our number of carts stayed the same, as did our total number of observations. 
 
 ### Create TOTAL_ITEMS
 
@@ -470,7 +470,7 @@ This table shows that there are a few items with very high abandonment rates, bu
 
 #### Top Items Appearing in Abandoned Carts
 
- Our baseline abandonment rate is approximately 15%, so we decided to take a look at the items that had an abandonment rate above that baseline.
+ 
 
 ```{r}
 # filter for items with an abandonment rate above 15%
@@ -517,7 +517,7 @@ ggplot(top_n_items, aes(x = reorder(ITEM_ID, ABANDONED_CARTS_WITH_ITEM),
 top_n_items
 ```
 
-All of these items have an abandonment rate of 15% or higher. SKU 413074, Grandma's Pantry Ginger Chai, stands out for having an abandonment rate of 21%, and it appears in approximately 78 abandoned carts. 
+All of these items have an abandonment rate of higher than our baseline.
 
 #### Top Flavors Appearing in Abandoned Carts
 
@@ -620,7 +620,7 @@ ggplot(packsize_abandonment |> slice_head(n = 15),
 head(packsize_abandonment, 15)
 ```
 
-While the 20 OZ size does appear in a large number of abandoned carts, that is probably due to it being in a large proportion of all carts. 
+ 
 
 #### Top Beverage Categories Appearing in Abandoned Carts
 
@@ -677,7 +677,6 @@ ggplot(bevcat_abandonment |> slice_head(n = 15),
 head(bevcat_abandonment, 15)
 ```
 
-Core Sparkling appears in the highest number of abandoned carts, with an abandonment rate of 15.8%. Enhance Water Beverages has an abandonment rate of 23.11% and appears in 230 abandoned carts.
 
 #### Top Brands Appearing in Abandoned Carts
 
@@ -729,8 +728,7 @@ ggplot(trademark_abandonment |> slice_head(n = 15),
 head(trademark_abandonment, 15)
 ```
 
-At a 16.64% abandonment rate, Fizz Factory’s abandonment rate is only slightly above our 15% baseline, but it is present in a large number of abandoned carts at 3,334.
-
+A
 #### Top Pack Types Appearing in Abandoned Carts
 
 ```{r}
@@ -790,7 +788,7 @@ Another business question was, “What behavioral events or sequence of events a
 
 The other issue we had to consider was how the behavior of a large-volume customer, such as a wholesaler or chain retailer, might overpower the behavior of a smaller-volume customer, such as a standalone small restaurant. Taking this into consideration, we decided to compute the proportion of each individual event type that occurred in each purchase window. So, if there were 10 events and 3 of them were `button_click`, then `button_click` would have a score of 0.30. If a specific type of event did not occur, then it would have a score of 0. This way, all of our observations would keep the same dimensions without blank or missing data.
 
-The end result was a single row per `CART_ID`, 50,910 total rows, our target variable `ABANDON`, and 148 columns for all of the unique event names.
+The end result was a single row per `CART_ID`,  our target variable `ABANDON`, and 148 columns for all of the unique event names.
 
 This table does not contain any other data, but using `CART_ID`, it could be merged back with the aggregated table containing the other data we have. 
 
@@ -1749,11 +1747,12 @@ summ$feature_plot
 
 ```
 
-The DBSCAN model identified three non-noise clusters with an average silhouette score of 0.571, indicating that observations within each cluster are, on average, more similar to one another than to those in other clusters.
+The DBSCAN model identified three non-noise clusters with an average silhouette score of redacted, indicating that observations within each cluster are, on average, more similar to one another than to those in other clusters.
 
 The 3D visualization reveals that Cluster 2 passes through the center of Cluster 1; however, the two clusters occupy distinct regions within the feature space. This spatial separation further aligns with the moderate silhouette score, suggesting a meaningful but not absolute distinction between clusters.
 
 Analysis of event feature means highlights behavioral differences across clusters. Specifically, Cluster 2 demonstrates a higher abandonment rate than Cluster 1, with notable disparities in events such as user_engagement and screen_view, which appear to be key drivers of the observed behavioral segmentation. 
+
 
 
 
