@@ -10,7 +10,7 @@ A cart was considered abandoned if an item was added to the cart and a purchase 
 
 ## Solution to the Problem
 
-Our group used data from google_analytics.csv, orders.csv, visit_plan.csv, customer.csv, cutoff_times.csv, operating_hours.csv, and material.csv to create a combined table. Using this combined dataset, we identified 50,910 purchase windows and found that 14.8% of these windows resulted in abandoned carts.  
+Our group used data from google_analytics.csv, orders.csv, visit_plan.csv, customer.csv, cutoff_times.csv, operating_hours.csv, and material.csv to create a combined table. Using this combined dataset, we identified purchase windows and calculated an abandonment rate.  
 
 Using a comparison of means to examine how frequently different behaviors occurred within a purchase window, we found that events such as viewing items and searching for items occurred more frequently in abandoned carts than in non-abandoned carts.  
 
@@ -34,7 +34,7 @@ We recommended that Swire Coca-Cola incorporate a feature into the checkout proc
 
 ## Difficulties Encountered
 
-There were several limitations to the data. For example, we did not have any data from the period prior to the implementation of the MyCoke360 platform. This would have allowed us not only to compare abandonment rates before and after the platform launch, but also to perform a causal analysis. Approximately 23,000 rows of data were missing key information.  
+There were several limitations to the data. For example, we did not have any data from the period prior to the implementation of the MyCoke360 platform. This would have allowed us not only to compare abandonment rates before and after the platform launch, but also to perform a causal analysis.   
 
 Creating the purchase windows was a considerable challenge. We had to adjust timestamps for different events and purchase cutoff times based on the locations of the regional sales offices. Additionally, there were no unique purchase or transaction identification numbers, so we used a combination of timestamps and customer identifiers to group items that were purchased together.  
 
