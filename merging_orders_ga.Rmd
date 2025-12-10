@@ -195,7 +195,7 @@ merged_orders_customer_material[is.na(tz_customer), unique(SALES_OFFICE_DESCRIPT
 ```
 
 
- There are 195 NAs under Material_ID, this doesn't mean much for the google analytics join but it does represent the 195 customers who have not made an order.
+ There are redacted NAs under Material_ID, this doesn't mean much for the google analytics join but it does represent the redacted customers who have not made an order.
 ```{r}
 head(merged_orders_customer_material)
 skim(merged_orders_customer_material)
@@ -359,5 +359,6 @@ write.csv(google_analytics_orders,"google_analytics_orders.csv",row.names = FALS
 ```{r}
 head(merged_orders_customer_material)
 ```
+
 
 
